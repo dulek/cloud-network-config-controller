@@ -152,33 +152,15 @@ func (o *OpenStack) initCredentials() error {
 	return nil
 }
 
-// AssignPrivateIP attempts to assigning the IP address provided to the VM
-// instance corresponding to the corev1.Node provided on the cloud the
-// cluster is deployed on.
-// NOTE: This operation is performed against all interfaces that are attached
-// to the server. In case that an instance has 2 interfaces with the same CIDR
-// that this IP address could fit in, the first interface that is found will be used.
-// No guarantees about the correct interface ordering are given in such a case.
-// Throw an AlreadyExistingIPError if the IP provided is already associated with the
-// node, it's up to the caller to decide what to do with that.
-// NOTE: For OpenStack, this is a 2 step operation which is not atomic:
-//   a) Reserve a neutron port.
-//   b) Add the IP address to the allowed_address_pairs field.
-// If step b) fails, then we will try to undo step a). However, if this undo fails,
-// then we will be in a situation where the user or an upper layer will have to call
-// ReleasePrivateIP to get out of this situation.
-func (o *OpenStack) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
-	if node == nil {
-		return fmt.Errorf("invalid nil pointer provided for node when trying to assign private IP %s", ip.String())
-	}
+func (o *OpenStack) findAssignSubnetAndPort(ip net.IP, node *corev1.Node) (*neutronsubnets.Subnet, *neutronports.Port, error) {
 	// List all ports that are attached to this server.
 	serverID, err := getNovaServerIDFromProviderID(node.Spec.ProviderID)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	serverPorts, err := o.listNovaServerPorts(serverID)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// Loop over all ports that are attached to this nova instance and find the subnets
@@ -190,7 +172,7 @@ func (o *OpenStack) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
 			// This is part of normal operation.
 			// Callers will likely ignore this and go on with their business logic and
 			// report success to the user.
-			return AlreadyExistingIPError
+			return nil, nil, AlreadyExistingIPError
 		}
 
 		// Get all subnets that are attached to this port.
@@ -225,45 +207,127 @@ func (o *OpenStack) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
 				continue
 			}
 			if matchingSubnet != nil {
-				return fmt.Errorf("requested IP address %s for node %s and port %s matches 2 different subnets, %s and %s",
+				return nil, nil, fmt.Errorf("requested IP address %s for node %s and port %s matches 2 different subnets, %s and %s",
 					ip, node.Name, serverPort.ID, matchingSubnet.ID, s.ID)
 			}
+
 			matchingSubnet = &s
 		}
+
 		if matchingSubnet != nil {
-			// 2) Reserve the IP address on the subnet by creating a new unattached neutron port.
-			unboundPort, err := o.reserveNeutronIPAddress(*matchingSubnet, ip, serverID)
-			if err != nil {
-				return err
-			}
-			// 3) Then, add the IP address to the port's allowed_address_pairs.
-			//    TODO: use a more elegant retry mechanism.
-			if err = o.allowIPAddressOnNeutronPort(serverPort.ID, ip); err != nil && !errors.Is(err, AlreadyExistingIPError) {
-				// Try to clean up the allocated port if adding the IP to allowed_address_pairs failed.
-				// Try this 10 times, but if this operation fails more than that, then user intervention is needed or
-				// the upper layer must call ReleasePrivateIP (because if the neutron port exists and holds
-				// a reservation, then the assign step will not continue after step 2).
-				var errRelease error
-				var releaseStatus string
-				for i := 0; i < 10; i++ {
-					errRelease = o.releaseNeutronIPAddress(*unboundPort, serverID)
-					// If the release operation was successful, then we are done.
-					if errRelease == nil {
-						releaseStatus = "Released neutron port reservation."
-						break
-					}
-					// Otherwise store the error message and retry.
-					releaseStatus = fmt.Sprintf("Could not release neutron port reservation after %d tries, err: %q", i+1, errRelease)
-				}
-				return fmt.Errorf("could not allow IP address %s on port %s, err: %q. %s", ip.String(), serverPort.ID, err, releaseStatus)
-			}
-			// 4) Return nil to indicate success if steps 2 and 3 passed.
-			return nil
+			return matchingSubnet, &serverPort, nil
 		}
 	}
 
 	// 5) The IP address does not fit in any of the attached networks' subnets.
+	return nil, nil, fmt.Errorf("could not assign IP address %s to node %s", ip, node.Name)
+}
+
+// AssignPrivateIP attempts to assigning the IP address provided to the VM
+// instance corresponding to the corev1.Node provided on the cloud the
+// cluster is deployed on.
+// NOTE: This operation is performed against all interfaces that are attached
+// to the server. In case that an instance has 2 interfaces with the same CIDR
+// that this IP address could fit in, the first interface that is found will be used.
+// No guarantees about the correct interface ordering are given in such a case.
+// Throw an AlreadyExistingIPError if the IP provided is already associated with the
+// node, it's up to the caller to decide what to do with that.
+// NOTE: For OpenStack, this is a 2 step operation which is not atomic:
+//   a) Reserve a neutron port.
+//   b) Add the IP address to the allowed_address_pairs field.
+// If step b) fails, then we will try to undo step a). However, if this undo fails,
+// then we will be in a situation where the user or an upper layer will have to call
+// ReleasePrivateIP to get out of this situation.
+func (o *OpenStack) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
+	if node == nil {
+		return fmt.Errorf("invalid nil pointer provided for node when trying to assign private IP %s", ip.String())
+	}
+	// List all ports that are attached to this server.
+	serverID, err := getNovaServerIDFromProviderID(node.Spec.ProviderID)
+	if err != nil {
+		return err
+	}
+
+	matchingSubnet, matchingPort, err := o.findAssignSubnetAndPort(ip, node)
+	if err != nil {
+		return err
+	}
+
+	if matchingSubnet != nil {
+		// 2) Reserve the IP address on the subnet by creating a new unattached neutron port.
+		unboundPort, err := o.reserveNeutronIPAddress(*matchingSubnet, ip, serverID)
+		if err != nil {
+			return err
+		}
+		// 3) Then, add the IP address to the port's allowed_address_pairs.
+		//    TODO: use a more elegant retry mechanism.
+		if err = o.allowIPAddressOnNeutronPort(matchingPort.ID, ip); err != nil && !errors.Is(err, AlreadyExistingIPError) {
+			// Try to clean up the allocated port if adding the IP to allowed_address_pairs failed.
+			// Try this 10 times, but if this operation fails more than that, then user intervention is needed or
+			// the upper layer must call ReleasePrivateIP (because if the neutron port exists and holds
+			// a reservation, then the assign step will not continue after step 2).
+			var errRelease error
+			var releaseStatus string
+			for i := 0; i < 10; i++ {
+				errRelease = o.releaseNeutronIPAddress(*unboundPort, serverID)
+				// If the release operation was successful, then we are done.
+				if errRelease == nil {
+					releaseStatus = "Released neutron port reservation."
+					break
+				}
+				// Otherwise store the error message and retry.
+				releaseStatus = fmt.Sprintf("Could not release neutron port reservation after %d tries, err: %q", i+1, errRelease)
+			}
+			return fmt.Errorf("could not allow IP address %s on port %s, err: %q. %s", ip.String(), matchingPort.ID, err, releaseStatus)
+		}
+		// 4) Return nil to indicate success if steps 2 and 3 passed.
+		return nil
+	}
+
+	// 5) The IP address does not fit in any of the attached networks' subnets.
 	return fmt.Errorf("could not assign IP address %s to node %s", ip, node.Name)
+}
+
+func (o *OpenStack) AllowsMovePrivateIP() bool {
+	return true
+}
+
+func (o *OpenStack) MovePrivateIP(ip net.IP, nodeToAdd, nodeToDel *corev1.Node) error {
+	if nodeToAdd == nil || nodeToDel == nil {
+		return fmt.Errorf("invalid nil pointer provided for node when trying to move IP %s", ip.String())
+	}
+
+	// List all ports that are attached to this server.
+	serverID, err := getNovaServerIDFromProviderID(nodeToDel.Spec.ProviderID)
+	if err != nil {
+		return err
+	}
+	serverPorts, err := o.listNovaServerPorts(serverID)
+	if err != nil {
+		return err
+	}
+
+	// Loop over all ports that are attached to this nova instance.
+	for _, serverPort := range serverPorts {
+		if isIPAddressAllowedOnNeutronPort(serverPort, ip) {
+			if err = o.unallowIPAddressOnNeutronPort(serverPort.ID, ip); err != nil {
+				return err
+			}
+		}
+	}
+
+	// TODO(dulek): Should we even care if we haven't found the IP? I'd say no, maybe we've removed it in
+	//              a previous try?
+
+	_, port, err := o.findAssignSubnetAndPort(ip, nodeToAdd)
+	if err != nil {
+		return err
+	}
+
+	if err = o.allowIPAddressOnNeutronPort(port.ID, ip); err != nil && !errors.Is(err, AlreadyExistingIPError) {
+		return fmt.Errorf("could not allow IP address %s on port %s, err: %q", ip.String(), port.ID, err)
+	}
+	return nil
 }
 
 // ReleasePrivateIP attempts to release the IP address provided from the

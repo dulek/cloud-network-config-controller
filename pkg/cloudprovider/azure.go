@@ -131,6 +131,14 @@ func (a *Azure) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
 	return a.waitForCompletion(result)
 }
 
+func (a *Azure) AllowsMovePrivateIP() bool {
+	return false
+}
+
+func (a *Azure) MovePrivateIP(ip net.IP, nodeToAdd, nodeToDel *corev1.Node) error {
+	return nil
+}
+
 func (a *Azure) ReleasePrivateIP(ip net.IP, node *corev1.Node) error {
 	instance, err := a.getInstance(node)
 	if err != nil {

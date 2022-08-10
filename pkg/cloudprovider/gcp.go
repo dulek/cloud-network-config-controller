@@ -83,6 +83,14 @@ func (g *GCP) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
 	return g.waitForCompletion(project, zone, operation.Name)
 }
 
+func (g *GCP) AllowsMovePrivateIP() bool {
+	return false
+}
+
+func (g *GCP) MovePrivateIP(ip net.IP, nodeToAdd, nodeToDel *corev1.Node) error {
+	return nil
+}
+
 // ReleasePrivateIP removes the IP alias from the associated instance.
 // Important: GCP IP aliases can come in all forms, i.e: if you add 10.0.32.25
 // GCP can return 10.0.32.25/32 or 10.0.32.25

@@ -106,6 +106,14 @@ func (a *AWS) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
 	}
 }
 
+func (a *AWS) AllowsMovePrivateIP() bool {
+	return false
+}
+
+func (a *AWS) MovePrivateIP(ip net.IP, nodeToAdd, nodeToDel *corev1.Node) error {
+	return nil
+}
+
 // ReleasePrivateIP un-assigns the IP address from the node. It does this on a
 // per-IP-family basis (since the AWS API is separated per family).  If the IP
 // is non-existant: it returns an NonExistingIPError.

@@ -42,6 +42,12 @@ type CloudProviderIntf interface {
 	// node, it's up to the caller to decide what to do with that.
 	AssignPrivateIP(ip net.IP, node *corev1.Node) error
 
+	// TODO(dulek): This comment
+	AllowsMovePrivateIP() bool
+
+	// TODO(dulek): This comment
+	MovePrivateIP(ip net.IP, nodeToAdd *corev1.Node, nodeToDel *corev1.Node) error
+
 	// ReleasePrivateIP attempts to releasing the IP address provided from the
 	// VM instance corresponding to the corev1.Node provided on the cloud the
 	// cluster is deployed on. NOTE: this operation is only performed against
